@@ -1,0 +1,6 @@
+.git
+bin
+tmp
+*.md
+docs
+scripts
