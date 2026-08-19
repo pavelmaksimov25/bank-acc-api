@@ -4,7 +4,7 @@
 
 **Goal:** Build a production-minded HTTP API to create accounts, deposit money, and transfer money atomically between accounts, backed by PostgreSQL.
 
-**Architecture:** Four small packages with one responsibility each: `config` (env), `bank` (domain types, sentinel errors, `Store` interface, `Service` with static validation), `postgres` (GORM implementation of `bank.Store`, ordered-lock transfer, goose migrations), `api` (stdlib `net/http` router, handlers, error mapping, middleware). `main` wires them and handles graceful shutdown. Correctness under concurrency lives in a single locking DB transaction; the `bank.Store` interface exists to break the import cycle between domain and persistence and to make the domain unit-testable without a database.
+**Architecture:** Four small packages with one responsibility each: `config` (env), `bank` (domain types, sentinel errors, `Store` interface, `Service` with static validation), `postgres` (GORM implementation of `bank.AccountRepository`, ordered-lock transfer, goose migrations), `api` (stdlib `net/http` router, handlers, error mapping, middleware). `main` wires them and handles graceful shutdown. Correctness under concurrency lives in a single locking DB transaction; the `bank.AccountRepository` interface exists to break the import cycle between domain and persistence and to make the domain unit-testable without a database.
 
 **Tech Stack:** Go 1.26, stdlib `net/http` (1.22+ routing), GORM + `gorm.io/driver/postgres`, goose migrations, `google/uuid`, PostgreSQL 16. Tests: `testify` + `testcontainers-go`.
 
@@ -44,8 +44,8 @@ internal/bank/service_test.go          # unit tests with a fake Store
 internal/postgres/models.go            # accountRow (GORM), toDomain
 internal/postgres/migrate.go           # embedded goose runner
 internal/postgres/migrations/0001_init.sql
-internal/postgres/store.go             # Store: Create/Get/Deposit/Transfer
-internal/postgres/store_test.go        # integration (testcontainers) + TestMain
+internal/postgres/repository.go             # Store: Create/Get/Deposit/Transfer
+internal/postgres/repository_test.go        # integration (testcontainers) + TestMain
 internal/api/dto.go                    # request/response structs
 internal/api/errors.go                 # error -> HTTP mapping, JSON helpers
 internal/api/handlers.go               # Handler, Service interface
@@ -325,8 +325,8 @@ git commit -m "feat: add bank domain types and sentinel errors"
 
 **Interfaces:**
 - Produces:
-  - `type Store interface { CreateAccount(ctx, initialBalance int64) (Account, error); GetAccount(ctx, id uuid.UUID) (Account, error); Deposit(ctx, id uuid.UUID, amount int64) (Account, error); Transfer(ctx, from, to uuid.UUID, amount int64) (TransferResult, error) }` (all take `context.Context` first).
-  - `type Service struct{...}`, `func NewService(store Store) *Service`, and methods `CreateAccount`, `GetAccount`, `Deposit`, `Transfer` with the same signatures as `Store`.
+  - `type AccountRepository interface { Create(ctx, initialBalance int64) (Account, error); Get(ctx, id uuid.UUID) (Account, error); Deposit(ctx, id uuid.UUID, amount int64) (Account, error); Transfer(ctx, from, to uuid.UUID, amount int64) (TransferResult, error) }` (all take `context.Context` first).
+  - `type AccountService struct{...}`, `func NewAccountService(store Store) *Service`, and methods `Create`, `Get`, `Deposit`, `Transfer` with the same signatures as `Store`.
 - Contract: `Service` performs only **static** validation (amount > 0, initial balance ≥ 0, from ≠ to) then delegates. Existence and funds checks belong to the store (they require the lock).
 
 - [ ] **Step 1: Write the failing test**
@@ -351,11 +351,11 @@ type fakeStore struct {
 	transfer      TransferResult
 }
 
-func (f *fakeStore) CreateAccount(_ context.Context, initialBalance int64) (Account, error) {
+func (f *fakeStore) Create(_ context.Context, initialBalance int64) (Account, error) {
 	f.createCalls++
 	return Account{ID: uuid.New(), Balance: initialBalance}, nil
 }
-func (f *fakeStore) GetAccount(_ context.Context, id uuid.UUID) (Account, error) {
+func (f *fakeStore) Get(_ context.Context, id uuid.UUID) (Account, error) {
 	return Account{ID: id}, nil
 }
 func (f *fakeStore) Deposit(_ context.Context, id uuid.UUID, amount int64) (Account, error) {
@@ -367,30 +367,30 @@ func (f *fakeStore) Transfer(_ context.Context, from, to uuid.UUID, amount int64
 	return TransferResult{FromAccountID: from, ToAccountID: to, Amount: amount}, nil
 }
 
-func TestService_CreateAccount_RejectsNegativeBalance(t *testing.T) {
+func TestService_Create_RejectsNegativeBalance(t *testing.T) {
 	fs := &fakeStore{}
-	svc := NewService(fs)
+	svc := NewAccountService(fs)
 
-	_, err := svc.CreateAccount(context.Background(), -1)
+	_, err := svc.Create(context.Background(), -1)
 
 	assert.ErrorIs(t, err, ErrNegativeBalance)
 	assert.Equal(t, 0, fs.createCalls, "store must not be called on invalid input")
 }
 
-func TestService_CreateAccount_AllowsZeroAndPositive(t *testing.T) {
+func TestService_Create_AllowsZeroAndPositive(t *testing.T) {
 	fs := &fakeStore{}
-	svc := NewService(fs)
+	svc := NewAccountService(fs)
 
-	_, err := svc.CreateAccount(context.Background(), 0)
+	_, err := svc.Create(context.Background(), 0)
 	require.NoError(t, err)
-	_, err = svc.CreateAccount(context.Background(), 100)
+	_, err = svc.Create(context.Background(), 100)
 	require.NoError(t, err)
 	assert.Equal(t, 2, fs.createCalls)
 }
 
 func TestService_Deposit_RejectsNonPositive(t *testing.T) {
 	fs := &fakeStore{}
-	svc := NewService(fs)
+	svc := NewAccountService(fs)
 
 	_, err := svc.Deposit(context.Background(), uuid.New(), 0)
 
@@ -400,7 +400,7 @@ func TestService_Deposit_RejectsNonPositive(t *testing.T) {
 
 func TestService_Transfer_RejectsNonPositive(t *testing.T) {
 	fs := &fakeStore{}
-	svc := NewService(fs)
+	svc := NewAccountService(fs)
 
 	_, err := svc.Transfer(context.Background(), uuid.New(), uuid.New(), -5)
 
@@ -410,7 +410,7 @@ func TestService_Transfer_RejectsNonPositive(t *testing.T) {
 
 func TestService_Transfer_RejectsSelfTransfer(t *testing.T) {
 	fs := &fakeStore{}
-	svc := NewService(fs)
+	svc := NewAccountService(fs)
 	id := uuid.New()
 
 	_, err := svc.Transfer(context.Background(), id, id, 10)
@@ -421,7 +421,7 @@ func TestService_Transfer_RejectsSelfTransfer(t *testing.T) {
 
 func TestService_Transfer_DelegatesWhenValid(t *testing.T) {
 	fs := &fakeStore{}
-	svc := NewService(fs)
+	svc := NewAccountService(fs)
 
 	_, err := svc.Transfer(context.Background(), uuid.New(), uuid.New(), 10)
 
@@ -433,7 +433,7 @@ func TestService_Transfer_DelegatesWhenValid(t *testing.T) {
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `go test ./internal/bank/ -run TestService -v`
-Expected: FAIL — `undefined: NewService` / `Store`.
+Expected: FAIL — `undefined: NewAccountService` / `AccountRepository`.
 
 - [ ] **Step 3: Write minimal implementation**
 
@@ -448,9 +448,9 @@ import (
 	"github.com/google/uuid"
 )
 
-type Store interface {
-	CreateAccount(ctx context.Context, initialBalance int64) (Account, error)
-	GetAccount(ctx context.Context, id uuid.UUID) (Account, error)
+type AccountRepository interface {
+	Create(ctx context.Context, initialBalance int64) (Account, error)
+	Get(ctx context.Context, id uuid.UUID) (Account, error)
 	Deposit(ctx context.Context, id uuid.UUID, amount int64) (Account, error)
 	Transfer(ctx context.Context, from, to uuid.UUID, amount int64) (TransferResult, error)
 }
@@ -467,33 +467,33 @@ import (
 	"github.com/google/uuid"
 )
 
-type Service struct {
+type AccountService struct {
 	store Store
 }
 
-func NewService(store Store) *Service {
-	return &Service{store: store}
+func NewAccountService(store Store) *Service {
+	return &AccountService{store: store}
 }
 
-func (s *Service) CreateAccount(ctx context.Context, initialBalance int64) (Account, error) {
+func (s *AccountService) Create(ctx context.Context, initialBalance int64) (Account, error) {
 	if initialBalance < 0 {
 		return Account{}, ErrNegativeBalance
 	}
-	return s.store.CreateAccount(ctx, initialBalance)
+	return s.store.Create(ctx, initialBalance)
 }
 
-func (s *Service) GetAccount(ctx context.Context, id uuid.UUID) (Account, error) {
-	return s.store.GetAccount(ctx, id)
+func (s *AccountService) Get(ctx context.Context, id uuid.UUID) (Account, error) {
+	return s.store.Get(ctx, id)
 }
 
-func (s *Service) Deposit(ctx context.Context, id uuid.UUID, amount int64) (Account, error) {
+func (s *AccountService) Deposit(ctx context.Context, id uuid.UUID, amount int64) (Account, error) {
 	if amount <= 0 {
 		return Account{}, ErrInvalidAmount
 	}
 	return s.store.Deposit(ctx, id, amount)
 }
 
-func (s *Service) Transfer(ctx context.Context, from, to uuid.UUID, amount int64) (TransferResult, error) {
+func (s *AccountService) Transfer(ctx context.Context, from, to uuid.UUID, amount int64) (TransferResult, error) {
 	if amount <= 0 {
 		return TransferResult{}, ErrInvalidAmount
 	}
@@ -522,17 +522,17 @@ git commit -m "feat: add bank service with static validation"
 
 ---
 
-## Task 5: Postgres store — migrations, setup, CreateAccount, GetAccount
+## Task 5: Postgres store — migrations, setup, Create, Get
 
 **Files:**
-- Create: `internal/postgres/models.go`, `internal/postgres/migrate.go`, `internal/postgres/migrations/0001_init.sql`, `internal/postgres/store.go`, `internal/postgres/store_test.go`
+- Create: `internal/postgres/models.go`, `internal/postgres/migrate.go`, `internal/postgres/migrations/0001_init.sql`, `internal/postgres/repository.go`, `internal/postgres/repository_test.go`
 
 **Interfaces:**
-- Consumes: `bank.Account`, `bank.ErrAccountNotFound`, `bank.Store`.
+- Consumes: `bank.Account`, `bank.ErrAccountNotFound`, `bank.AccountRepository`.
 - Produces:
-  - `func NewStore(db *gorm.DB) *Store` — `*Store` implements `bank.Store`.
+  - `func NewRepository(db *gorm.DB) *Repository` — `*Repository` implements `bank.AccountRepository`.
   - `func Migrate(db *sql.DB) error` — applies embedded goose migrations.
-  - test helpers `testStore *Store` (package-level, started in `TestMain`) and `truncate(t *testing.T)`.
+  - test helpers `testRepo *Repository` (package-level, started in `TestMain`) and `truncate(t *testing.T)`.
 
 - [ ] **Step 1: Write the migration**
 
@@ -578,7 +578,7 @@ func Migrate(db *sql.DB) error {
 
 - [ ] **Step 3: Write the failing test (with testcontainers harness)**
 
-`internal/postgres/store_test.go`:
+`internal/postgres/repository_test.go`:
 
 ```go
 package postgres
@@ -601,7 +601,7 @@ import (
 	"github.com/pavlomaksymov/bank-account-api/internal/bank"
 )
 
-var testStore *Store
+var testRepo *Repository
 
 func TestMain(m *testing.M) {
 	ctx := context.Background()
@@ -631,7 +631,7 @@ func TestMain(m *testing.M) {
 	if err := Migrate(sqlDB); err != nil {
 		panic(err)
 	}
-	testStore = NewStore(gdb)
+	testRepo = NewRepository(gdb)
 
 	code := m.Run()
 	_ = container.Terminate(ctx)
@@ -640,29 +640,29 @@ func TestMain(m *testing.M) {
 
 func truncate(t *testing.T) {
 	t.Helper()
-	require.NoError(t, testStore.db.Exec("TRUNCATE accounts").Error)
+	require.NoError(t, testRepo.db.Exec("TRUNCATE accounts").Error)
 }
 
-func TestStore_CreateAndGetAccount(t *testing.T) {
+func TestRepository_CreateAndGet(t *testing.T) {
 	truncate(t)
 	ctx := context.Background()
 
-	created, err := testStore.CreateAccount(ctx, 500)
+	created, err := testRepo.Create(ctx, 500)
 	require.NoError(t, err)
 	assert.NotEqual(t, uuid.Nil, created.ID)
 	assert.Equal(t, int64(500), created.Balance)
 	assert.False(t, created.CreatedAt.IsZero())
 
-	got, err := testStore.GetAccount(ctx, created.ID)
+	got, err := testRepo.Get(ctx, created.ID)
 	require.NoError(t, err)
 	assert.Equal(t, created.ID, got.ID)
 	assert.Equal(t, int64(500), got.Balance)
 }
 
-func TestStore_GetAccount_NotFound(t *testing.T) {
+func TestRepository_Get_NotFound(t *testing.T) {
 	truncate(t)
 
-	_, err := testStore.GetAccount(context.Background(), uuid.New())
+	_, err := testRepo.Get(context.Background(), uuid.New())
 
 	assert.ErrorIs(t, err, bank.ErrAccountNotFound)
 }
@@ -670,8 +670,8 @@ func TestStore_GetAccount_NotFound(t *testing.T) {
 
 - [ ] **Step 4: Run test to verify it fails**
 
-Run: `go test ./internal/postgres/ -run TestStore_CreateAndGetAccount -v`
-Expected: FAIL — `undefined: NewStore` / `Store`. (Docker must be running.)
+Run: `go test ./internal/postgres/ -run TestRepository_CreateAndGet -v`
+Expected: FAIL — `undefined: NewRepository` / `Repository`. (Docker must be running.)
 
 - [ ] **Step 5: Write minimal implementation**
 
@@ -701,7 +701,7 @@ func (r accountRow) toDomain() bank.Account {
 }
 ```
 
-`internal/postgres/store.go` (Create + Get only for now):
+`internal/postgres/repository.go` (Create + Get only for now):
 
 ```go
 package postgres
@@ -716,15 +716,15 @@ import (
 	"github.com/pavlomaksymov/bank-account-api/internal/bank"
 )
 
-type Store struct {
+type Repository struct {
 	db *gorm.DB
 }
 
-func NewStore(db *gorm.DB) *Store {
-	return &Store{db: db}
+func NewRepository(db *gorm.DB) *Repository {
+	return &Repository{db: db}
 }
 
-func (s *Store) CreateAccount(ctx context.Context, initialBalance int64) (bank.Account, error) {
+func (s *Repository) Create(ctx context.Context, initialBalance int64) (bank.Account, error) {
 	row := accountRow{ID: uuid.New(), Balance: initialBalance}
 	if err := s.db.WithContext(ctx).Create(&row).Error; err != nil {
 		return bank.Account{}, err
@@ -732,7 +732,7 @@ func (s *Store) CreateAccount(ctx context.Context, initialBalance int64) (bank.A
 	return row.toDomain(), nil
 }
 
-func (s *Store) GetAccount(ctx context.Context, id uuid.UUID) (bank.Account, error) {
+func (s *Repository) Get(ctx context.Context, id uuid.UUID) (bank.Account, error) {
 	var row accountRow
 	err := s.db.WithContext(ctx).First(&row, "id = ?", id).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -747,7 +747,7 @@ func (s *Store) GetAccount(ctx context.Context, id uuid.UUID) (bank.Account, err
 
 - [ ] **Step 6: Run test to verify it passes**
 
-Run: `go test ./internal/postgres/ -run 'TestStore_CreateAndGetAccount|TestStore_GetAccount_NotFound' -v`
+Run: `go test ./internal/postgres/ -run 'TestRepository_CreateAndGet|TestRepository_Get_NotFound' -v`
 Expected: PASS.
 
 - [ ] **Step 7: Commit**
@@ -762,36 +762,36 @@ git commit -m "feat: add postgres store with migrations, create and get account"
 ## Task 6: Postgres Deposit
 
 **Files:**
-- Modify: `internal/postgres/store.go`
-- Test: `internal/postgres/store_test.go`
+- Modify: `internal/postgres/repository.go`
+- Test: `internal/postgres/repository_test.go`
 
 **Interfaces:**
-- Produces: `func (s *Store) Deposit(ctx, id uuid.UUID, amount int64) (bank.Account, error)` — locks the row, adds `amount`, returns the updated account; unknown id → `bank.ErrAccountNotFound`.
+- Produces: `func (s *Repository) Deposit(ctx, id uuid.UUID, amount int64) (bank.Account, error)` — locks the row, adds `amount`, returns the updated account; unknown id → `bank.ErrAccountNotFound`.
 
 - [ ] **Step 1: Write the failing test**
 
-Append to `internal/postgres/store_test.go`:
+Append to `internal/postgres/repository_test.go`:
 
 ```go
-func TestStore_Deposit_IncreasesBalance(t *testing.T) {
+func TestRepository_Deposit_IncreasesBalance(t *testing.T) {
 	truncate(t)
 	ctx := context.Background()
-	acc, err := testStore.CreateAccount(ctx, 100)
+	acc, err := testRepo.Create(ctx, 100)
 	require.NoError(t, err)
 
-	updated, err := testStore.Deposit(ctx, acc.ID, 250)
+	updated, err := testRepo.Deposit(ctx, acc.ID, 250)
 	require.NoError(t, err)
 	assert.Equal(t, int64(350), updated.Balance)
 
-	got, err := testStore.GetAccount(ctx, acc.ID)
+	got, err := testRepo.Get(ctx, acc.ID)
 	require.NoError(t, err)
 	assert.Equal(t, int64(350), got.Balance)
 }
 
-func TestStore_Deposit_NotFound(t *testing.T) {
+func TestRepository_Deposit_NotFound(t *testing.T) {
 	truncate(t)
 
-	_, err := testStore.Deposit(context.Background(), uuid.New(), 50)
+	_, err := testRepo.Deposit(context.Background(), uuid.New(), 50)
 
 	assert.ErrorIs(t, err, bank.ErrAccountNotFound)
 }
@@ -799,17 +799,17 @@ func TestStore_Deposit_NotFound(t *testing.T) {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `go test ./internal/postgres/ -run TestStore_Deposit -v`
-Expected: FAIL — `undefined: (*Store).Deposit`.
+Run: `go test ./internal/postgres/ -run TestRepository_Deposit -v`
+Expected: FAIL — `undefined: (*Repository).Deposit`.
 
 - [ ] **Step 3: Write minimal implementation**
 
-Add to `internal/postgres/store.go`:
+Add to `internal/postgres/repository.go`:
 
 ```go
 import "gorm.io/gorm/clause" // add to the import block
 
-func (s *Store) Deposit(ctx context.Context, id uuid.UUID, amount int64) (bank.Account, error) {
+func (s *Repository) Deposit(ctx context.Context, id uuid.UUID, amount int64) (bank.Account, error) {
 	var row accountRow
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -833,13 +833,13 @@ func (s *Store) Deposit(ctx context.Context, id uuid.UUID, amount int64) (bank.A
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `go test ./internal/postgres/ -run TestStore_Deposit -v`
+Run: `go test ./internal/postgres/ -run TestRepository_Deposit -v`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add internal/postgres/store.go internal/postgres/store_test.go
+git add internal/postgres/repository.go internal/postgres/repository_test.go
 git commit -m "feat: add deposit with row locking"
 ```
 
@@ -848,55 +848,55 @@ git commit -m "feat: add deposit with row locking"
 ## Task 7: Postgres Transfer (ordered locking)
 
 **Files:**
-- Modify: `internal/postgres/store.go`
-- Test: `internal/postgres/store_test.go`
+- Modify: `internal/postgres/repository.go`
+- Test: `internal/postgres/repository_test.go`
 
 **Interfaces:**
-- Produces: `func (s *Store) Transfer(ctx, from, to uuid.UUID, amount int64) (bank.TransferResult, error)`. Locks both rows in ascending id order inside one transaction; unknown account → `bank.ErrAccountNotFound`; source funds < amount → `bank.ErrInsufficientFunds`. On success debits source, credits destination, returns both new balances.
+- Produces: `func (s *Repository) Transfer(ctx, from, to uuid.UUID, amount int64) (bank.TransferResult, error)`. Locks both rows in ascending id order inside one transaction; unknown account → `bank.ErrAccountNotFound`; source funds < amount → `bank.ErrInsufficientFunds`. On success debits source, credits destination, returns both new balances.
 
 - [ ] **Step 1: Write the failing test**
 
-Append to `internal/postgres/store_test.go`:
+Append to `internal/postgres/repository_test.go`:
 
 ```go
-func TestStore_Transfer_MovesFunds(t *testing.T) {
+func TestRepository_Transfer_MovesFunds(t *testing.T) {
 	truncate(t)
 	ctx := context.Background()
-	from, err := testStore.CreateAccount(ctx, 1000)
+	from, err := testRepo.Create(ctx, 1000)
 	require.NoError(t, err)
-	to, err := testStore.CreateAccount(ctx, 200)
+	to, err := testRepo.Create(ctx, 200)
 	require.NoError(t, err)
 
-	res, err := testStore.Transfer(ctx, from.ID, to.ID, 300)
+	res, err := testRepo.Transfer(ctx, from.ID, to.ID, 300)
 	require.NoError(t, err)
 	assert.Equal(t, int64(700), res.FromBalance)
 	assert.Equal(t, int64(500), res.ToBalance)
 
-	gotFrom, _ := testStore.GetAccount(ctx, from.ID)
-	gotTo, _ := testStore.GetAccount(ctx, to.ID)
+	gotFrom, _ := testRepo.Get(ctx, from.ID)
+	gotTo, _ := testRepo.Get(ctx, to.ID)
 	assert.Equal(t, int64(700), gotFrom.Balance)
 	assert.Equal(t, int64(500), gotTo.Balance)
 }
 
-func TestStore_Transfer_InsufficientFunds(t *testing.T) {
+func TestRepository_Transfer_InsufficientFunds(t *testing.T) {
 	truncate(t)
 	ctx := context.Background()
-	from, _ := testStore.CreateAccount(ctx, 100)
-	to, _ := testStore.CreateAccount(ctx, 0)
+	from, _ := testRepo.Create(ctx, 100)
+	to, _ := testRepo.Create(ctx, 0)
 
-	_, err := testStore.Transfer(ctx, from.ID, to.ID, 500)
+	_, err := testRepo.Transfer(ctx, from.ID, to.ID, 500)
 
 	assert.ErrorIs(t, err, bank.ErrInsufficientFunds)
-	gotFrom, _ := testStore.GetAccount(ctx, from.ID)
+	gotFrom, _ := testRepo.Get(ctx, from.ID)
 	assert.Equal(t, int64(100), gotFrom.Balance, "balance unchanged on failed transfer")
 }
 
-func TestStore_Transfer_UnknownAccount(t *testing.T) {
+func TestRepository_Transfer_UnknownAccount(t *testing.T) {
 	truncate(t)
 	ctx := context.Background()
-	from, _ := testStore.CreateAccount(ctx, 100)
+	from, _ := testRepo.Create(ctx, 100)
 
-	_, err := testStore.Transfer(ctx, from.ID, uuid.New(), 10)
+	_, err := testRepo.Transfer(ctx, from.ID, uuid.New(), 10)
 
 	assert.ErrorIs(t, err, bank.ErrAccountNotFound)
 }
@@ -904,15 +904,15 @@ func TestStore_Transfer_UnknownAccount(t *testing.T) {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `go test ./internal/postgres/ -run TestStore_Transfer -v`
-Expected: FAIL — `undefined: (*Store).Transfer`.
+Run: `go test ./internal/postgres/ -run TestRepository_Transfer -v`
+Expected: FAIL — `undefined: (*Repository).Transfer`.
 
 - [ ] **Step 3: Write minimal implementation**
 
-Add to `internal/postgres/store.go`:
+Add to `internal/postgres/repository.go`:
 
 ```go
-func (s *Store) Transfer(ctx context.Context, from, to uuid.UUID, amount int64) (bank.TransferResult, error) {
+func (s *Repository) Transfer(ctx context.Context, from, to uuid.UUID, amount int64) (bank.TransferResult, error) {
 	var result bank.TransferResult
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var rows []accountRow
@@ -968,15 +968,15 @@ func (s *Store) Transfer(ctx context.Context, from, to uuid.UUID, amount int64) 
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `go test ./internal/postgres/ -run TestStore_Transfer -v`
+Run: `go test ./internal/postgres/ -run TestRepository_Transfer -v`
 Expected: PASS.
 
 - [ ] **Step 5: Refactor check**
 
-Confirm the store fully satisfies `bank.Store`. Add a compile-time assertion at the top of `store.go`:
+Confirm the store fully satisfies `bank.AccountRepository`. Add a compile-time assertion at the top of `store.go`:
 
 ```go
-var _ bank.Store = (*Store)(nil)
+var _ bank.AccountRepository = (*Repository)(nil)
 ```
 
 Run: `go build ./internal/postgres/`
@@ -985,7 +985,7 @@ Expected: compiles.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add internal/postgres/store.go internal/postgres/store_test.go
+git add internal/postgres/repository.go internal/postgres/repository_test.go
 git commit -m "feat: add atomic transfer with ordered row locking"
 ```
 
@@ -997,7 +997,7 @@ git commit -m "feat: add atomic transfer with ordered row locking"
 - Test: `internal/postgres/concurrency_test.go`
 
 **Interfaces:**
-- Consumes: `testStore`, `truncate` from `store_test.go` (same package).
+- Consumes: `testRepo`, `truncate` from `store_test.go` (same package).
 - Produces: no new production code — this task proves FR6 (money conservation, no negative balances, no deadlocks) against the real database.
 
 - [ ] **Step 1: Write the failing test**
@@ -1029,7 +1029,7 @@ func TestTransfer_ConcurrentConservesMoney(t *testing.T) {
 	const initial = int64(1000)
 	ids := make([]uuid.UUID, n)
 	for i := range ids {
-		acc, err := testStore.CreateAccount(ctx, initial)
+		acc, err := testRepo.Create(ctx, initial)
 		require.NoError(t, err)
 		ids[i] = acc.ID
 	}
@@ -1050,7 +1050,7 @@ func TestTransfer_ConcurrentConservesMoney(t *testing.T) {
 					continue
 				}
 				amount := int64(r.Intn(50) + 1)
-				_, err := testStore.Transfer(ctx, from, to, amount)
+				_, err := testRepo.Transfer(ctx, from, to, amount)
 				if err != nil && !errors.Is(err, bank.ErrInsufficientFunds) {
 					assert.NoError(t, err, "only insufficient-funds is an acceptable failure")
 				}
@@ -1061,7 +1061,7 @@ func TestTransfer_ConcurrentConservesMoney(t *testing.T) {
 
 	var sum int64
 	for _, id := range ids {
-		acc, err := testStore.GetAccount(ctx, id)
+		acc, err := testRepo.Get(ctx, id)
 		require.NoError(t, err)
 		assert.GreaterOrEqual(t, acc.Balance, int64(0), "no balance may go negative")
 		sum += acc.Balance
@@ -1072,8 +1072,8 @@ func TestTransfer_ConcurrentConservesMoney(t *testing.T) {
 func TestTransfer_OpposingTransfersNoDeadlock(t *testing.T) {
 	truncate(t)
 	ctx := context.Background()
-	a, _ := testStore.CreateAccount(ctx, 100000)
-	b, _ := testStore.CreateAccount(ctx, 100000)
+	a, _ := testRepo.Create(ctx, 100000)
+	b, _ := testRepo.Create(ctx, 100000)
 
 	const rounds = 200
 	var wg sync.WaitGroup
@@ -1081,19 +1081,19 @@ func TestTransfer_OpposingTransfersNoDeadlock(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < rounds; i++ {
-			_, _ = testStore.Transfer(ctx, a.ID, b.ID, 1)
+			_, _ = testRepo.Transfer(ctx, a.ID, b.ID, 1)
 		}
 	}()
 	go func() {
 		defer wg.Done()
 		for i := 0; i < rounds; i++ {
-			_, _ = testStore.Transfer(ctx, b.ID, a.ID, 1)
+			_, _ = testRepo.Transfer(ctx, b.ID, a.ID, 1)
 		}
 	}()
 	wg.Wait()
 
-	gotA, _ := testStore.GetAccount(ctx, a.ID)
-	gotB, _ := testStore.GetAccount(ctx, b.ID)
+	gotA, _ := testRepo.Get(ctx, a.ID)
+	gotB, _ := testRepo.Get(ctx, b.ID)
 	assert.Equal(t, int64(200000), gotA.Balance+gotB.Balance)
 }
 ```
@@ -1270,9 +1270,9 @@ git commit -m "feat: add api error mapping and json helpers"
 - Create: `internal/api/dto.go`, `internal/api/handlers.go`, `internal/api/router.go`, `internal/api/handlers_test.go`
 
 **Interfaces:**
-- Consumes: `bank.Account`, `bank.TransferResult`, `bank.Service` (satisfies the `Service` interface below), `writeJSON`, `writeError`, `errInvalidRequest`.
+- Consumes: `bank.Account`, `bank.TransferResult`, `bank.AccountService` (satisfies the `Service` interface below), `writeJSON`, `writeError`, `errInvalidRequest`.
 - Produces:
-  - `type Service interface { CreateAccount(ctx, initialBalance int64) (bank.Account, error); GetAccount(ctx, id uuid.UUID) (bank.Account, error); Deposit(ctx, id uuid.UUID, amount int64) (bank.Account, error); Transfer(ctx, from, to uuid.UUID, amount int64) (bank.TransferResult, error) }`.
+  - `type Service interface { Create(ctx, initialBalance int64) (bank.Account, error); Get(ctx, id uuid.UUID) (bank.Account, error); Deposit(ctx, id uuid.UUID, amount int64) (bank.Account, error); Transfer(ctx, from, to uuid.UUID, amount int64) (bank.TransferResult, error) }`.
   - `func NewHandler(svc Service) *Handler` with methods `createAccount`, `getAccount`, `deposit`, `transfer`, `health`.
   - `func NewRouter(h *Handler) http.Handler` (middleware wired in Task 11; until then wrap the mux directly).
 
@@ -1350,10 +1350,10 @@ type fakeService struct {
 	err      error
 }
 
-func (f fakeService) CreateAccount(context.Context, int64) (bank.Account, error) {
+func (f fakeService) Create(context.Context, int64) (bank.Account, error) {
 	return f.account, f.err
 }
-func (f fakeService) GetAccount(context.Context, uuid.UUID) (bank.Account, error) {
+func (f fakeService) Get(context.Context, uuid.UUID) (bank.Account, error) {
 	return f.account, f.err
 }
 func (f fakeService) Deposit(context.Context, uuid.UUID, int64) (bank.Account, error) {
@@ -1363,7 +1363,7 @@ func (f fakeService) Transfer(context.Context, uuid.UUID, uuid.UUID, int64) (ban
 	return f.transfer, f.err
 }
 
-func TestCreateAccount_Created(t *testing.T) {
+func TestCreate_Created(t *testing.T) {
 	id := uuid.New()
 	h := NewHandler(fakeService{account: bank.Account{ID: id, Balance: 1000}})
 	srv := NewRouter(h)
@@ -1376,7 +1376,7 @@ func TestCreateAccount_Created(t *testing.T) {
 	assert.Contains(t, rec.Body.String(), id.String())
 }
 
-func TestCreateAccount_MalformedJSON(t *testing.T) {
+func TestCreate_MalformedJSON(t *testing.T) {
 	h := NewHandler(fakeService{})
 	srv := NewRouter(h)
 
@@ -1387,7 +1387,7 @@ func TestCreateAccount_MalformedJSON(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
-func TestGetAccount_BadUUID(t *testing.T) {
+func TestGet_BadUUID(t *testing.T) {
 	h := NewHandler(fakeService{})
 	srv := NewRouter(h)
 
@@ -1424,7 +1424,7 @@ func TestHealth_OK(t *testing.T) {
 
 - [ ] **Step 3: Run test to verify it fails**
 
-Run: `go test ./internal/api/ -run 'TestCreateAccount|TestGetAccount|TestTransfer_Insufficient|TestHealth' -v`
+Run: `go test ./internal/api/ -run 'TestCreate|TestGet|TestTransfer_Insufficient|TestHealth' -v`
 Expected: FAIL — `undefined: NewHandler` / `NewRouter`.
 
 - [ ] **Step 4: Write minimal implementation**
@@ -1445,8 +1445,8 @@ import (
 )
 
 type Service interface {
-	CreateAccount(ctx context.Context, initialBalance int64) (bank.Account, error)
-	GetAccount(ctx context.Context, id uuid.UUID) (bank.Account, error)
+	Create(ctx context.Context, initialBalance int64) (bank.Account, error)
+	Get(ctx context.Context, id uuid.UUID) (bank.Account, error)
 	Deposit(ctx context.Context, id uuid.UUID, amount int64) (bank.Account, error)
 	Transfer(ctx context.Context, from, to uuid.UUID, amount int64) (bank.TransferResult, error)
 }
@@ -1474,7 +1474,7 @@ func (h *Handler) createAccount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	acc, err := h.svc.CreateAccount(r.Context(), req.InitialBalance)
+	acc, err := h.svc.Create(r.Context(), req.InitialBalance)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -1488,7 +1488,7 @@ func (h *Handler) getAccount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, errInvalidRequest)
 		return
 	}
-	acc, err := h.svc.GetAccount(r.Context(), id)
+	acc, err := h.svc.Get(r.Context(), id)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -1565,11 +1565,11 @@ Expected: PASS.
 
 - [ ] **Step 6: Refactor check**
 
-Add compile-time proof that `*bank.Service` satisfies `api.Service` — put it in `handlers.go`:
+Add compile-time proof that `*bank.AccountService` satisfies `api.Service` — put it in `handlers.go`:
 
 ```go
-// keeps the api.Service contract in lockstep with bank.Service
-var _ Service = (*bank.Service)(nil)
+// keeps the api.Service contract in lockstep with bank.AccountService
+var _ Service = (*bank.AccountService)(nil)
 ```
 
 Run: `go build ./...`
@@ -1744,7 +1744,7 @@ git commit -m "feat: add request-id, logging and panic-recovery middleware"
 - Create: `internal/api/integration_test.go`, `cmd/api/main.go`
 
 **Interfaces:**
-- Consumes: `config.Load`, `postgres.NewStore`, `postgres.Migrate`, `bank.NewService`, `api.NewHandler`, `api.NewRouter`.
+- Consumes: `config.Load`, `postgres.NewRepository`, `postgres.Migrate`, `bank.NewAccountService`, `api.NewHandler`, `api.NewRouter`.
 - Produces: a runnable binary at `cmd/api` and a test proving the whole stack (HTTP → service → real Postgres) works end to end.
 
 - [ ] **Step 1: Write the failing integration test**
@@ -1796,7 +1796,7 @@ func newStack(t *testing.T) http.Handler {
 	require.NoError(t, err)
 	require.NoError(t, postgres.Migrate(sqlDB))
 
-	svc := bank.NewService(postgres.NewStore(gdb))
+	svc := bank.NewAccountService(postgres.NewRepository(gdb))
 	return api.NewRouter(api.NewHandler(svc))
 }
 
@@ -1901,7 +1901,7 @@ func run() error {
 		return err
 	}
 
-	svc := bank.NewService(postgres.NewStore(gdb))
+	svc := bank.NewAccountService(postgres.NewRepository(gdb))
 	router := api.NewRouter(api.NewHandler(svc))
 	srv := &http.Server{Addr: ":" + cfg.Port, Handler: router}
 
@@ -2143,4 +2143,4 @@ git commit -m "docs: add readme with setup, api reference and trade-offs"
 
 **2. Placeholder scan:** no TBD/TODO; every code and test step contains complete code. ✓
 
-**3. Type consistency:** `bank.Store` / `api.Service` method sets are identical and match `*bank.Service` and `*postgres.Store` (compile-time assertions in Tasks 7 and 10). `Account`/`TransferResult` field names consistent across `bank`, `postgres`, `api`. ✓
+**3. Type consistency:** `bank.AccountRepository` / `api.Service` method sets are identical and match `*bank.AccountService` and `*postgres.Store` (compile-time assertions in Tasks 7 and 10). `Account`/`TransferResult` field names consistent across `bank`, `postgres`, `api`. ✓
