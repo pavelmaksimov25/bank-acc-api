@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type AccountRepository interface {
@@ -47,6 +48,27 @@ func (s *Repository) Create(ctx context.Context, initialBalance int64) (Account,
 func (s *Repository) Get(ctx context.Context, id uuid.UUID) (Account, error) {
 	var row accountRow
 	err := s.db.WithContext(ctx).First(&row, "id = ?", id).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return Account{}, ErrAccountNotFound
+	}
+	if err != nil {
+		return Account{}, err
+	}
+	return row.toDomain(), nil
+}
+
+func (s *Repository) Deposit(ctx context.Context, id uuid.UUID, amount int64) (Account, error) {
+	var row accountRow
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			First(&row, "id = ?", id).Error; err != nil {
+			return err
+		}
+		row.Balance += amount
+		return tx.Model(&accountRow{}).
+			Where("id = ?", id).
+			Update("balance", row.Balance).Error
+	})
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return Account{}, ErrAccountNotFound
 	}
