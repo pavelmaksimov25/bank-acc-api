@@ -4,7 +4,7 @@
 
 **Goal:** Build a production-minded HTTP API to create accounts, deposit money, and transfer money atomically between accounts, backed by PostgreSQL.
 
-**Architecture:** Four small packages with one responsibility each: `config` (env), `bank` (domain types, sentinel errors, `Store` interface, `Service` with static validation), `postgres` (GORM implementation of `bank.AccountRepository`, ordered-lock transfer, goose migrations), `api` (stdlib `net/http` router, handlers, error mapping, middleware). `main` wires them and handles graceful shutdown. Correctness under concurrency lives in a single locking DB transaction; the `bank.AccountRepository` interface exists to break the import cycle between domain and persistence and to make the domain unit-testable without a database.
+**Architecture:** `config` (env), `bank` (domain types, sentinel errors, the `AccountRepository` interface co-located with its GORM implementation `Repository`, and the `AccountService` that validates then delegates), `api` (stdlib `net/http` router, handlers, error mapping, middleware), and a top-level `migrations` package (embedded goose SQL applied via `Up`). `main` wires them and handles graceful shutdown. Correctness under concurrency lives in a single locking DB transaction; the `AccountRepository` interface keeps the domain service unit-testable with a fake.
 
 **Tech Stack:** Go 1.26, stdlib `net/http` (1.22+ routing), GORM + `gorm.io/driver/postgres`, goose migrations, `google/uuid`, PostgreSQL 16. Tests: `testify` + `testcontainers-go`.
 
@@ -41,11 +41,11 @@ internal/bank/errors.go                # sentinel errors
 internal/bank/store.go                 # Store interface
 internal/bank/service.go               # Service: static validation + delegation
 internal/bank/service_test.go          # unit tests with a fake Store
-internal/postgres/models.go            # accountRow (GORM), toDomain
-internal/postgres/migrate.go           # embedded goose runner
-internal/postgres/migrations/0001_init.sql
-internal/postgres/repository.go             # Store: Create/Get/Deposit/Transfer
-internal/postgres/repository_test.go        # integration (testcontainers) + TestMain
+internal/bank/account_repository.go            # accountRow (GORM), toDomain
+migrations/migrations.go           # embedded goose runner
+migrations/0001_init.sql
+internal/bank/account_repository.go             # Store: Create/Get/Deposit/Transfer
+internal/bank/account_repository_test.go        # integration (testcontainers) + TestMain
 internal/api/dto.go                    # request/response structs
 internal/api/errors.go                 # error -> HTTP mapping, JSON helpers
 internal/api/handlers.go               # Handler, Service interface
@@ -525,7 +525,7 @@ git commit -m "feat: add bank service with static validation"
 ## Task 5: Postgres store — migrations, setup, Create, Get
 
 **Files:**
-- Create: `internal/postgres/models.go`, `internal/postgres/migrate.go`, `internal/postgres/migrations/0001_init.sql`, `internal/postgres/repository.go`, `internal/postgres/repository_test.go`
+- Create: `internal/bank/account_repository.go`, `migrations/migrations.go`, `migrations/0001_init.sql`, `internal/bank/account_repository.go`, `internal/bank/account_repository_test.go`
 
 **Interfaces:**
 - Consumes: `bank.Account`, `bank.ErrAccountNotFound`, `bank.AccountRepository`.
@@ -536,7 +536,7 @@ git commit -m "feat: add bank service with static validation"
 
 - [ ] **Step 1: Write the migration**
 
-`internal/postgres/migrations/0001_init.sql`:
+`migrations/0001_init.sql`:
 
 ```sql
 -- +goose Up
@@ -552,10 +552,10 @@ DROP TABLE accounts;
 
 - [ ] **Step 2: Write the migration runner**
 
-`internal/postgres/migrate.go`:
+`migrations/migrations.go`:
 
 ```go
-package postgres
+package bank
 
 import (
 	"database/sql"
@@ -578,10 +578,10 @@ func Migrate(db *sql.DB) error {
 
 - [ ] **Step 3: Write the failing test (with testcontainers harness)**
 
-`internal/postgres/repository_test.go`:
+`internal/bank/account_repository_test.go`:
 
 ```go
-package postgres
+package bank
 
 import (
 	"context"
@@ -670,15 +670,15 @@ func TestRepository_Get_NotFound(t *testing.T) {
 
 - [ ] **Step 4: Run test to verify it fails**
 
-Run: `go test ./internal/postgres/ -run TestRepository_CreateAndGet -v`
+Run: `go test ./internal/bank/ -run TestRepository_CreateAndGet -v`
 Expected: FAIL — `undefined: NewRepository` / `Repository`. (Docker must be running.)
 
 - [ ] **Step 5: Write minimal implementation**
 
-`internal/postgres/models.go`:
+`internal/bank/account_repository.go`:
 
 ```go
-package postgres
+package bank
 
 import (
 	"time"
@@ -701,10 +701,10 @@ func (r accountRow) toDomain() bank.Account {
 }
 ```
 
-`internal/postgres/repository.go` (Create + Get only for now):
+`internal/bank/account_repository.go` (Create + Get only for now):
 
 ```go
-package postgres
+package bank
 
 import (
 	"context"
@@ -747,13 +747,13 @@ func (s *Repository) Get(ctx context.Context, id uuid.UUID) (bank.Account, error
 
 - [ ] **Step 6: Run test to verify it passes**
 
-Run: `go test ./internal/postgres/ -run 'TestRepository_CreateAndGet|TestRepository_Get_NotFound' -v`
+Run: `go test ./internal/bank/ -run 'TestRepository_CreateAndGet|TestRepository_Get_NotFound' -v`
 Expected: PASS.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add internal/postgres/
+git add internal/bank/
 git commit -m "feat: add postgres store with migrations, create and get account"
 ```
 
@@ -762,15 +762,15 @@ git commit -m "feat: add postgres store with migrations, create and get account"
 ## Task 6: Postgres Deposit
 
 **Files:**
-- Modify: `internal/postgres/repository.go`
-- Test: `internal/postgres/repository_test.go`
+- Modify: `internal/bank/account_repository.go`
+- Test: `internal/bank/account_repository_test.go`
 
 **Interfaces:**
 - Produces: `func (s *Repository) Deposit(ctx, id uuid.UUID, amount int64) (bank.Account, error)` — locks the row, adds `amount`, returns the updated account; unknown id → `bank.ErrAccountNotFound`.
 
 - [ ] **Step 1: Write the failing test**
 
-Append to `internal/postgres/repository_test.go`:
+Append to `internal/bank/account_repository_test.go`:
 
 ```go
 func TestRepository_Deposit_IncreasesBalance(t *testing.T) {
@@ -799,12 +799,12 @@ func TestRepository_Deposit_NotFound(t *testing.T) {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `go test ./internal/postgres/ -run TestRepository_Deposit -v`
+Run: `go test ./internal/bank/ -run TestRepository_Deposit -v`
 Expected: FAIL — `undefined: (*Repository).Deposit`.
 
 - [ ] **Step 3: Write minimal implementation**
 
-Add to `internal/postgres/repository.go`:
+Add to `internal/bank/account_repository.go`:
 
 ```go
 import "gorm.io/gorm/clause" // add to the import block
@@ -833,13 +833,13 @@ func (s *Repository) Deposit(ctx context.Context, id uuid.UUID, amount int64) (b
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `go test ./internal/postgres/ -run TestRepository_Deposit -v`
+Run: `go test ./internal/bank/ -run TestRepository_Deposit -v`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add internal/postgres/repository.go internal/postgres/repository_test.go
+git add internal/bank/account_repository.go internal/bank/account_repository_test.go
 git commit -m "feat: add deposit with row locking"
 ```
 
@@ -848,15 +848,15 @@ git commit -m "feat: add deposit with row locking"
 ## Task 7: Postgres Transfer (ordered locking)
 
 **Files:**
-- Modify: `internal/postgres/repository.go`
-- Test: `internal/postgres/repository_test.go`
+- Modify: `internal/bank/account_repository.go`
+- Test: `internal/bank/account_repository_test.go`
 
 **Interfaces:**
 - Produces: `func (s *Repository) Transfer(ctx, from, to uuid.UUID, amount int64) (bank.TransferResult, error)`. Locks both rows in ascending id order inside one transaction; unknown account → `bank.ErrAccountNotFound`; source funds < amount → `bank.ErrInsufficientFunds`. On success debits source, credits destination, returns both new balances.
 
 - [ ] **Step 1: Write the failing test**
 
-Append to `internal/postgres/repository_test.go`:
+Append to `internal/bank/account_repository_test.go`:
 
 ```go
 func TestRepository_Transfer_MovesFunds(t *testing.T) {
@@ -904,12 +904,12 @@ func TestRepository_Transfer_UnknownAccount(t *testing.T) {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `go test ./internal/postgres/ -run TestRepository_Transfer -v`
+Run: `go test ./internal/bank/ -run TestRepository_Transfer -v`
 Expected: FAIL — `undefined: (*Repository).Transfer`.
 
 - [ ] **Step 3: Write minimal implementation**
 
-Add to `internal/postgres/repository.go`:
+Add to `internal/bank/account_repository.go`:
 
 ```go
 func (s *Repository) Transfer(ctx context.Context, from, to uuid.UUID, amount int64) (bank.TransferResult, error) {
@@ -968,7 +968,7 @@ func (s *Repository) Transfer(ctx context.Context, from, to uuid.UUID, amount in
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `go test ./internal/postgres/ -run TestRepository_Transfer -v`
+Run: `go test ./internal/bank/ -run TestRepository_Transfer -v`
 Expected: PASS.
 
 - [ ] **Step 5: Refactor check**
@@ -979,13 +979,13 @@ Confirm the store fully satisfies `bank.AccountRepository`. Add a compile-time a
 var _ bank.AccountRepository = (*Repository)(nil)
 ```
 
-Run: `go build ./internal/postgres/`
+Run: `go build ./internal/bank/`
 Expected: compiles.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add internal/postgres/repository.go internal/postgres/repository_test.go
+git add internal/bank/account_repository.go internal/bank/account_repository_test.go
 git commit -m "feat: add atomic transfer with ordered row locking"
 ```
 
@@ -994,7 +994,7 @@ git commit -m "feat: add atomic transfer with ordered row locking"
 ## Task 8: Concurrency & consistency test (the key correctness proof)
 
 **Files:**
-- Test: `internal/postgres/concurrency_test.go`
+- Test: `internal/bank/concurrency_test.go`
 
 **Interfaces:**
 - Consumes: `testRepo`, `truncate` from `store_test.go` (same package).
@@ -1002,10 +1002,10 @@ git commit -m "feat: add atomic transfer with ordered row locking"
 
 - [ ] **Step 1: Write the failing test**
 
-`internal/postgres/concurrency_test.go`:
+`internal/bank/concurrency_test.go`:
 
 ```go
-package postgres
+package bank
 
 import (
 	"context"
@@ -1100,7 +1100,7 @@ func TestTransfer_OpposingTransfersNoDeadlock(t *testing.T) {
 
 - [ ] **Step 2: Run test to verify it passes (green immediately — implementation exists from Task 7)**
 
-Run: `go test ./internal/postgres/ -run 'TestTransfer_Concurrent|TestTransfer_Opposing' -race -v`
+Run: `go test ./internal/bank/ -run 'TestTransfer_Concurrent|TestTransfer_Opposing' -race -v`
 Expected: PASS with `-race` clean. If it fails on conservation or deadlocks, the locking in Task 7 is wrong — fix there before proceeding.
 
 > Note: this is the one task where the test is green on first run because it exercises Task 7's code. Its purpose is to *prove* the concurrency contract; treat a failure here as a Task 7 regression.
@@ -1108,7 +1108,7 @@ Expected: PASS with `-race` clean. If it fails on conservation or deadlocks, the
 - [ ] **Step 3: Commit**
 
 ```bash
-git add internal/postgres/concurrency_test.go
+git add internal/bank/concurrency_test.go
 git commit -m "test: prove money conservation and deadlock-freedom under concurrency"
 ```
 
@@ -1744,7 +1744,7 @@ git commit -m "feat: add request-id, logging and panic-recovery middleware"
 - Create: `internal/api/integration_test.go`, `cmd/api/main.go`
 
 **Interfaces:**
-- Consumes: `config.Load`, `postgres.NewRepository`, `postgres.Migrate`, `bank.NewAccountService`, `api.NewHandler`, `api.NewRouter`.
+- Consumes: `config.Load`, `bank.NewRepository`, `migrations.Up`, `bank.NewAccountService`, `api.NewHandler`, `api.NewRouter`.
 - Produces: a runnable binary at `cmd/api` and a test proving the whole stack (HTTP → service → real Postgres) works end to end.
 
 - [ ] **Step 1: Write the failing integration test**
@@ -1771,7 +1771,7 @@ import (
 
 	"github.com/pavlomaksymov/bank-account-api/internal/api"
 	"github.com/pavlomaksymov/bank-account-api/internal/bank"
-	"github.com/pavlomaksymov/bank-account-api/internal/postgres"
+	"github.com/pavlomaksymov/bank-account-api/migrations"
 )
 
 func newStack(t *testing.T) http.Handler {
@@ -1794,9 +1794,9 @@ func newStack(t *testing.T) http.Handler {
 	require.NoError(t, err)
 	sqlDB, err := gdb.DB()
 	require.NoError(t, err)
-	require.NoError(t, postgres.Migrate(sqlDB))
+	require.NoError(t, migrations.Up(sqlDB))
 
-	svc := bank.NewAccountService(postgres.NewRepository(gdb))
+	svc := bank.NewAccountService(bank.NewRepository(gdb))
 	return api.NewRouter(api.NewHandler(svc))
 }
 
@@ -1876,7 +1876,7 @@ import (
 	"github.com/pavlomaksymov/bank-account-api/internal/api"
 	"github.com/pavlomaksymov/bank-account-api/internal/bank"
 	"github.com/pavlomaksymov/bank-account-api/internal/config"
-	"github.com/pavlomaksymov/bank-account-api/internal/postgres"
+	"github.com/pavlomaksymov/bank-account-api/migrations"
 )
 
 func main() {
@@ -1897,11 +1897,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	if err := postgres.Migrate(sqlDB); err != nil {
+	if err := migrations.Up(sqlDB); err != nil {
 		return err
 	}
 
-	svc := bank.NewAccountService(postgres.NewRepository(gdb))
+	svc := bank.NewAccountService(bank.NewRepository(gdb))
 	router := api.NewRouter(api.NewHandler(svc))
 	srv := &http.Server{Addr: ":" + cfg.Port, Handler: router}
 
@@ -2030,7 +2030,7 @@ tidy:
 	go mod tidy
 
 migrate-create:
-	goose -dir internal/postgres/migrations create $(name) sql
+	goose -dir migrations create $(name) sql
 ```
 
 - [ ] **Step 4: Write `scripts/smoke.sh`**
@@ -2143,4 +2143,4 @@ git commit -m "docs: add readme with setup, api reference and trade-offs"
 
 **2. Placeholder scan:** no TBD/TODO; every code and test step contains complete code. ✓
 
-**3. Type consistency:** `bank.AccountRepository` / `api.Service` method sets are identical and match `*bank.AccountService` and `*postgres.Store` (compile-time assertions in Tasks 7 and 10). `Account`/`TransferResult` field names consistent across `bank`, `postgres`, `api`. ✓
+**3. Type consistency:** `AccountRepository` / `api.Service` method sets are identical and match `*bank.AccountService` and `*bank.Repository` (compile-time assertions in Tasks 7 and 10). `Account`/`TransferResult` field names consistent across `bank`, `api`. ✓
