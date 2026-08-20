@@ -83,3 +83,26 @@ func TestRepository_Get_NotFound(t *testing.T) {
 
 	assert.ErrorIs(t, err, ErrAccountNotFound)
 }
+
+func TestRepository_Deposit_IncreasesBalance(t *testing.T) {
+	truncate(t)
+	ctx := context.Background()
+	acc, err := testRepo.Create(ctx, 100)
+	require.NoError(t, err)
+
+	updated, err := testRepo.Deposit(ctx, acc.ID, 250)
+	require.NoError(t, err)
+	assert.Equal(t, int64(350), updated.Balance)
+
+	got, err := testRepo.Get(ctx, acc.ID)
+	require.NoError(t, err)
+	assert.Equal(t, int64(350), got.Balance)
+}
+
+func TestRepository_Deposit_NotFound(t *testing.T) {
+	truncate(t)
+
+	_, err := testRepo.Deposit(context.Background(), uuid.New(), 50)
+
+	assert.ErrorIs(t, err, ErrAccountNotFound)
+}
