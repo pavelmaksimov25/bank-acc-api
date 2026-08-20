@@ -9,5 +9,5 @@ func NewRouter(h *Handler) http.Handler {
 	mux.HandleFunc("POST /accounts/{id}/deposits", h.deposit)
 	mux.HandleFunc("POST /transfers", h.transfer)
 	mux.HandleFunc("GET /healthz", h.health)
-	return mux
+	return withMiddleware(mux)
 }

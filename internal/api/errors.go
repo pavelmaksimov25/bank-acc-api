@@ -9,6 +9,7 @@ import (
 )
 
 var errInvalidRequest = errors.New("invalid request")
+var errInternal = errors.New("internal error")
 
 type errorBody struct {
 	Error errorDetail `json:"error"`
