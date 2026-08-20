@@ -1,0 +1,244 @@
+{
+  "info": {
+    "name": "Bank Account API",
+    "description": "SumUp take-home: create accounts, deposit, and transfer money atomically. Requests are ordered and chained via collection variables (accountA/accountB are captured from the create responses), so you can run the whole collection top-to-bottom in the Postman Runner or with `newman run`. Set `baseUrl` if the API is not on http://localhost:8080.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:8080" },
+    { "key": "accountA", "value": "" },
+    { "key": "accountB", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "request": {
+        "method": "GET",
+        "url": { "raw": "{{baseUrl}}/healthz", "host": ["{{baseUrl}}"], "path": ["healthz"] }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "pm.test('status ok', () => pm.expect(pm.response.json().status).to.eql('ok'));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Create account A (balance 1000)",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": { "raw": "{{baseUrl}}/accounts", "host": ["{{baseUrl}}"], "path": ["accounts"] },
+        "body": { "mode": "raw", "raw": "{\n  \"initial_balance\": 1000\n}" }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('201 Created', () => pm.response.to.have.status(201));",
+              "const body = pm.response.json();",
+              "pm.collectionVariables.set('accountA', body.id);",
+              "pm.test('balance is 1000', () => pm.expect(body.balance).to.eql(1000));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Create account B (balance 0)",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": { "raw": "{{baseUrl}}/accounts", "host": ["{{baseUrl}}"], "path": ["accounts"] },
+        "body": { "mode": "raw", "raw": "{\n  \"initial_balance\": 0\n}" }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('201 Created', () => pm.response.to.have.status(201));",
+              "const body = pm.response.json();",
+              "pm.collectionVariables.set('accountB', body.id);",
+              "pm.test('balance is 0', () => pm.expect(body.balance).to.eql(0));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Get account A",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/accounts/{{accountA}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["accounts", "{{accountA}}"]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "pm.test('id matches', () => pm.expect(pm.response.json().id).to.eql(pm.collectionVariables.get('accountA')));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Deposit 500 into A",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": {
+          "raw": "{{baseUrl}}/accounts/{{accountA}}/deposits",
+          "host": ["{{baseUrl}}"],
+          "path": ["accounts", "{{accountA}}", "deposits"]
+        },
+        "body": { "mode": "raw", "raw": "{\n  \"amount\": 500\n}" }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "pm.test('balance is 1500', () => pm.expect(pm.response.json().balance).to.eql(1500));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Transfer 600 from A to B",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": { "raw": "{{baseUrl}}/transfers", "host": ["{{baseUrl}}"], "path": ["transfers"] },
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"from_account_id\": \"{{accountA}}\",\n  \"to_account_id\": \"{{accountB}}\",\n  \"amount\": 600\n}"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "const body = pm.response.json();",
+              "pm.test('from_balance is 900', () => pm.expect(body.from_balance).to.eql(900));",
+              "pm.test('to_balance is 600', () => pm.expect(body.to_balance).to.eql(600));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Get account B (expect 600)",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/accounts/{{accountB}}",
+          "host": ["{{baseUrl}}"],
+          "path": ["accounts", "{{accountB}}"]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('200 OK', () => pm.response.to.have.status(200));",
+              "pm.test('balance is 600', () => pm.expect(pm.response.json().balance).to.eql(600));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Transfer overdraft B to A (expect 422)",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": { "raw": "{{baseUrl}}/transfers", "host": ["{{baseUrl}}"], "path": ["transfers"] },
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"from_account_id\": \"{{accountB}}\",\n  \"to_account_id\": \"{{accountA}}\",\n  \"amount\": 999999\n}"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('422 Unprocessable Entity', () => pm.response.to.have.status(422));",
+              "pm.test('code is insufficient_funds', () => pm.expect(pm.response.json().error.code).to.eql('insufficient_funds'));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Create account with negative balance (expect 422)",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": { "raw": "{{baseUrl}}/accounts", "host": ["{{baseUrl}}"], "path": ["accounts"] },
+        "body": { "mode": "raw", "raw": "{\n  \"initial_balance\": -100\n}" }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('422 Unprocessable Entity', () => pm.response.to.have.status(422));",
+              "pm.test('code is invalid_amount', () => pm.expect(pm.response.json().error.code).to.eql('invalid_amount'));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "Get account with malformed id (expect 400)",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/accounts/not-a-uuid",
+          "host": ["{{baseUrl}}"],
+          "path": ["accounts", "not-a-uuid"]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('400 Bad Request', () => pm.response.to.have.status(400));",
+              "pm.test('code is invalid_request', () => pm.expect(pm.response.json().error.code).to.eql('invalid_request'));"
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
