@@ -106,3 +106,95 @@ func TestRepository_Deposit_NotFound(t *testing.T) {
 
 	assert.ErrorIs(t, err, ErrAccountNotFound)
 }
+
+func TestRepository_Transfer_MovesFunds(t *testing.T) {
+	truncate(t)
+	ctx := context.Background()
+	from, err := testRepo.Create(ctx, 1000)
+	require.NoError(t, err)
+	to, err := testRepo.Create(ctx, 200)
+	require.NoError(t, err)
+
+	res, err := testRepo.Transfer(ctx, from.ID, to.ID, 300)
+	require.NoError(t, err)
+	assert.Equal(t, int64(700), res.FromBalance)
+	assert.Equal(t, int64(500), res.ToBalance)
+
+	gotFrom, _ := testRepo.Get(ctx, from.ID)
+	gotTo, _ := testRepo.Get(ctx, to.ID)
+	assert.Equal(t, int64(700), gotFrom.Balance)
+	assert.Equal(t, int64(500), gotTo.Balance)
+}
+
+func TestRepository_Transfer_InsufficientFunds(t *testing.T) {
+	truncate(t)
+	ctx := context.Background()
+	from, _ := testRepo.Create(ctx, 100)
+	to, _ := testRepo.Create(ctx, 0)
+
+	_, err := testRepo.Transfer(ctx, from.ID, to.ID, 500)
+
+	assert.ErrorIs(t, err, ErrInsufficientFunds)
+	gotFrom, _ := testRepo.Get(ctx, from.ID)
+	assert.Equal(t, int64(100), gotFrom.Balance, "balance unchanged on failed transfer")
+}
+
+func TestRepository_Transfer_UnknownAccount(t *testing.T) {
+	truncate(t)
+	ctx := context.Background()
+	from, _ := testRepo.Create(ctx, 100)
+
+	_, err := testRepo.Transfer(ctx, from.ID, uuid.New(), 10)
+
+	assert.ErrorIs(t, err, ErrAccountNotFound)
+}
+
+func TestRepository_Transfer_SelfTransfer(t *testing.T) {
+	truncate(t)
+	ctx := context.Background()
+	acc, err := testRepo.Create(ctx, 100)
+	require.NoError(t, err)
+
+	_, err = testRepo.Transfer(ctx, acc.ID, acc.ID, 50)
+	assert.ErrorIs(t, err, ErrSelfTransfer)
+
+	got, err := testRepo.Get(ctx, acc.ID)
+	require.NoError(t, err)
+	assert.Equal(t, int64(100), got.Balance, "self-transfer must not create money")
+}
+
+func TestRepository_Transfer_NonPositiveAmount(t *testing.T) {
+	truncate(t)
+	ctx := context.Background()
+	from, err := testRepo.Create(ctx, 1000)
+	require.NoError(t, err)
+	to, err := testRepo.Create(ctx, 0)
+	require.NoError(t, err)
+
+	_, err = testRepo.Transfer(ctx, from.ID, to.ID, 0)
+	assert.ErrorIs(t, err, ErrInvalidAmount)
+
+	_, err = testRepo.Transfer(ctx, from.ID, to.ID, -5)
+	assert.ErrorIs(t, err, ErrInvalidAmount)
+
+	got, err := testRepo.Get(ctx, from.ID)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1000), got.Balance, "balance unchanged after rejected transfers")
+}
+
+func TestRepository_Deposit_NonPositiveAmount(t *testing.T) {
+	truncate(t)
+	ctx := context.Background()
+	acc, err := testRepo.Create(ctx, 100)
+	require.NoError(t, err)
+
+	_, err = testRepo.Deposit(ctx, acc.ID, 0)
+	assert.ErrorIs(t, err, ErrInvalidAmount)
+
+	_, err = testRepo.Deposit(ctx, acc.ID, -5)
+	assert.ErrorIs(t, err, ErrInvalidAmount)
+
+	got, err := testRepo.Get(ctx, acc.ID)
+	require.NoError(t, err)
+	assert.Equal(t, int64(100), got.Balance, "balance unchanged after rejected deposits")
+}
